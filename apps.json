@@ -8,7 +8,19 @@
     "branch": "version-16"
   },
   {
-    "url": "https://github.com/Sudhanshu-Badole/Portal_Theme",
+    "url": "https://github.com/frappe/offsite_backups",
+    "branch": "version-16"
+  },
+  {
+    "url": "https://github.com/frappe/helpdesk",
+    "branch": "main"
+  },
+  {
+    "url": "https://github.com/frappe/telephony",
+    "branch": "main"
+  },
+  {
+    "url": "https://github.com/SGSTeamDev/green_theme",
     "branch": "version-16"
   }
 ]
