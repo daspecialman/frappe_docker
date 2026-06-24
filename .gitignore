@@ -28,3 +28,9 @@ venv
 
 # NodeJS
 node_modules
+
+# Ansible
+*.retry
+
+# Secrets — never commit these
+ansible/inventory/group_vars/vault-plain.yml

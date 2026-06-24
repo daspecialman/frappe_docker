@@ -1,0 +1,97 @@
+---
+- name: Deploy ERPNext
+  hosts: all
+  gather_facts: no
+  serial: 1
+
+  vars:
+    compose_files:
+      - compose.yaml
+      - overrides/compose.mariadb.yaml
+      - overrides/compose.redis.yaml
+      - overrides/compose.prod.yaml
+    compose_project_name: frappe
+
+  pre_tasks:
+    - name: Verify SSH connectivity
+      ansible.builtin.wait_for_connection:
+        timeout: 10
+      tags: [always, preflight]
+
+    - name: Verify Docker is running
+      ansible.builtin.command: docker info
+      changed_when: false
+      tags: [always, preflight]
+
+    - name: Verify docker compose is available
+      ansible.builtin.command: docker compose version
+      changed_when: false
+      tags: [always, preflight]
+
+  tasks:
+    - name: Ensure project directory exists
+      ansible.builtin.file:
+        path: "{{ projects_root }}/{{ app_name }}"
+        state: directory
+        mode: "0755"
+        owner: ansible
+        group: ansible
+      become: yes
+
+    - name: Sync project files
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ projects_root }}/{{ app_name }}"
+        delete: no
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=data"
+          - "--exclude=ansible"
+          - "--exclude=*.retry"
+          - "--exclude=development"
+          - "--exclude=devcontainer-example"
+          - "--exclude=docs"
+          - "--exclude=tests"
+          - "--exclude=sites"
+
+    - name: Check local .env exists
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../.env"
+      register: _local_env
+      tags: [deploy, check]
+
+    - name: Fail if local .env is missing
+      ansible.builtin.fail:
+        msg: ".env not found. Run `infisical export > .env` before deploying."
+      when: not _local_env.stat.exists
+      tags: [deploy, check]
+
+    - name: Backup existing .env on server
+      ansible.builtin.copy:
+        src: "{{ env_file_path }}"
+        dest: "{{ env_file_path }}.bak"
+        remote_src: yes
+      ignore_errors: yes
+
+    - name: Sync .env from local to server
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../.env"
+        dest: "{{ env_file_path }}"
+        mode: "0600"
+
+    - name: Deploy application stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ projects_root }}/{{ app_name }}"
+        files: "{{ compose_files }}"
+        project_name: "{{ compose_project_name }}"
+        state: present
+
+    - name: Prune unused Docker images
+      ansible.builtin.command: docker image prune -f
+      changed_when: false
+
+  post_tasks:
+    - name: Deployment successful
+      ansible.builtin.debug:
+        msg: "ERPNext deployed successfully to {{ projects_root }}/{{ app_name }}"

@@ -1,0 +1,47 @@
+---
+- name: Bootstrap server for Ansible management
+  hosts: all
+  gather_facts: no
+
+  vars:
+    ansible_user_name: ansible
+    ansible_user_home: "/home/{{ ansible_user_name }}"
+    ansible_ssh_key_source: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+
+  tasks:
+    - name: Fail if no SSH public key found locally
+      ansible.builtin.stat:
+        path: "{{ ansible_ssh_key_source }}"
+      delegate_to: localhost
+      register: _local_key
+      failed_when: not _local_key.stat.exists
+
+    - name: Read local SSH public key
+      ansible.builtin.slurp:
+        src: "{{ ansible_ssh_key_source }}"
+      delegate_to: localhost
+      register: _local_key_content
+      no_log: true
+
+    - name: Create ansible user
+      ansible.builtin.user:
+        name: "{{ ansible_user_name }}"
+        state: present
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Create .ssh directory for ansible user
+      ansible.builtin.file:
+        path: "{{ ansible_user_home }}/.ssh"
+        state: directory
+        mode: "0700"
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_user_name }}"
+
+    - name: Deploy SSH public key
+      ansible.builtin.copy:
+        dest: "{{ ansible_user_home }}/.ssh/authorized_keys"
+        content: "{{ _local_key_content.content | b64decode }}"
+        mode: "0600"
+        owner: "{{ ansible_user_name }}"
+        group: "{{ ansible_user_name }}"

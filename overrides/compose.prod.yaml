@@ -1,0 +1,16 @@
+services:
+  frontend:
+    ports:
+      - ${HTTP_PUBLISH_PORT:-8080}:8080
+
+volumes:
+  sites:
+    name: frappe_docker_sites
+  db-data:
+    name: frappe_docker_db-data
+  redis-queue-data:
+    name: frappe_docker_redis-queue-data
+
+networks:
+  default:
+    name: frappe_docker_default

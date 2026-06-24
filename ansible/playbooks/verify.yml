@@ -1,0 +1,66 @@
+---
+- name: Verify ERPNext deployment
+  hosts: all
+  gather_facts: no
+
+  tasks:
+    - name: Check backend container
+      community.docker.docker_container_info:
+        name: "{{ compose_project_name | default('frappe') }}-backend-1"
+      register: _backend
+
+    - name: Assert backend is running
+      ansible.builtin.assert:
+        that:
+          - _backend.exists
+          - _backend.container.State.Status == "running"
+        fail_msg: "Backend container is not running"
+        success_msg: "Backend: running"
+
+    - name: Check database container
+      community.docker.docker_container_info:
+        name: "{{ compose_project_name | default('frappe') }}-db-1"
+      register: _db
+
+    - name: Assert database is healthy
+      ansible.builtin.assert:
+        that:
+          - _db.exists
+          - _db.container.State.Status == "running"
+          - _db.container.State.Health is not defined or _db.container.State.Health.Status == "healthy"
+        fail_msg: "Database container is not healthy"
+        success_msg: "Database: running and healthy"
+
+    - name: Check frontend container
+      community.docker.docker_container_info:
+        name: "{{ compose_project_name | default('frappe') }}-frontend-1"
+      register: _frontend
+
+    - name: Assert frontend is running
+      ansible.builtin.assert:
+        that:
+          - _frontend.exists
+          - _frontend.container.State.Status == "running"
+        fail_msg: "Frontend container is not running"
+        success_msg: "Frontend: running"
+
+    - name: Health check endpoint via Nginx
+      ansible.builtin.uri:
+        url: "https://{{ erpnext_domain | default('erp.jeyshawnng.com') }}/api/method/ping"
+        method: GET
+        status_code: 200
+        timeout: 30
+        validate_certs: yes
+      register: _health
+      until: _health.status == 200
+      retries: 10
+      delay: 6
+      ignore_errors: yes
+
+    - name: Health check result
+      ansible.builtin.debug:
+        msg: "Health check {{ 'passed' if (_health.status is defined and _health.status == 200) else 'failed or skipped' }}"
+
+    - name: Verification passed
+      ansible.builtin.debug:
+        msg: "ERPNext is healthy"

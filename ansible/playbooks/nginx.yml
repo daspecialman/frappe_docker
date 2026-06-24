@@ -1,0 +1,30 @@
+---
+- name: Deploy ERPNext Nginx configuration
+  hosts: all
+  become: yes
+
+  vars:
+    nginx_site_config: /etc/nginx/sites-available/erpnext
+    nginx_site_enabled: /etc/nginx/sites-enabled/erpnext
+
+  tasks:
+    - name: Deploy Nginx site configuration
+      ansible.builtin.template:
+        src: nginx-erpnext.conf.j2
+        dest: "{{ nginx_site_config }}"
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Ensure site is enabled
+      ansible.builtin.file:
+        src: "{{ nginx_site_config }}"
+        dest: "{{ nginx_site_enabled }}"
+        state: link
+        force: yes
+      notify: reload nginx
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded

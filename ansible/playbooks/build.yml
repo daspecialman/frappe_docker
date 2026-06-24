@@ -1,0 +1,30 @@
+---
+- name: Rebuild custom Docker image and redeploy ERPNext
+  hosts: all
+  serial: 1
+
+  tasks:
+    - name: Read local apps.json and encode as base64
+      ansible.builtin.set_fact:
+        apps_json_b64: "{{ lookup('file', playbook_dir ~ '/../../apps.json') | b64encode }}"
+      delegate_to: localhost
+
+    - name: Build custom Docker image
+      community.docker.docker_image:
+        name: custom
+        tag: "16"
+        build:
+          path: "{{ projects_root }}/{{ app_name }}"
+          dockerfile: images/custom/Containerfile
+          args:
+            APPS_JSON_BASE64: "{{ apps_json_b64 }}"
+        source: build
+        force_source: yes
+
+    - name: Redeploy stack with new image
+      community.docker.docker_compose_v2:
+        project_src: "{{ projects_root }}/{{ app_name }}"
+        files: "{{ compose_files }}"
+        project_name: "{{ compose_project_name }}"
+        state: present
+        recreate: always

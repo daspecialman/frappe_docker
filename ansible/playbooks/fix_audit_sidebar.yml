@@ -1,0 +1,42 @@
+---
+- name: Fix Audit Dept. workspace sidebar visibility
+  hosts: all
+  gather_facts: no
+
+  vars:
+    site_name: Jeyshawn
+    backend_container: frappe-backend-1
+
+  tasks:
+    - name: Set Desktop Icon standard=1 for Audit Dept.
+      ansible.builtin.shell:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} mariadb --execute
+          "UPDATE \`tabDesktop Icon\` SET standard=1 WHERE label='Audit Dept.'"
+      changed_when: true
+      register: _sql_result
+
+    - name: Restart backend to clear cache
+      ansible.builtin.shell:
+        cmd: docker restart {{ backend_container }}
+      changed_when: true
+
+    - name: Wait for backend to become healthy
+      ansible.builtin.wait_for:
+        port: 8000
+        host: "{{ ansible_host | default('127.0.0.1') }}"
+        delay: 5
+        timeout: 30
+      ignore_errors: yes
+
+    - name: Confirm fix applied
+      ansible.builtin.shell:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} mariadb --execute
+          "SELECT label, standard, owner FROM \`tabDesktop Icon\` WHERE label='Audit Dept.'"
+      register: _check_result
+      changed_when: false
+
+    - name: Print result
+      ansible.builtin.debug:
+        msg: "{{ _check_result.stdout_lines }}"
