@@ -1,0 +1,58 @@
+---
+- name: Fix Requests workspace visibility (make Desktop Icon global, cache refresh)
+  hosts: all
+  gather_facts: no
+
+  vars:
+    site_name: Jeyshawn
+    backend_container: frappe-backend-1
+
+  tasks:
+    - name: Make Requests Desktop Icon standard (visible to all users)
+      ansible.builtin.shell:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} mariadb --execute
+          "UPDATE \`tabDesktop Icon\` SET standard=1 WHERE label='Requests'"
+      changed_when: true
+      register: _icon_result
+
+    - name: Confirm Requests Desktop Icon is now standard
+      ansible.builtin.shell:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} mariadb --execute
+          "SELECT label, standard, owner FROM \`tabDesktop Icon\` WHERE label='Requests'"
+      register: _icon_check
+      changed_when: false
+
+    - name: Print icon check
+      ansible.builtin.debug:
+        msg: "{{ _icon_check.stdout_lines }}"
+
+    - name: Normalize for_user on Requests workspace (NULL -> empty string)
+      ansible.builtin.shell:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.db.set_value
+          --args '["Workspace", "Requests", "for_user", ""]'
+      changed_when: true
+      register: _set_result
+
+    - name: Show for_user update result
+      ansible.builtin.debug:
+        msg: "{{ _set_result.stdout_lines }}"
+
+    - name: Clear site cache (user roles, bootinfo, workspace caches)
+      ansible.builtin.shell:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} clear-cache
+      changed_when: true
+
+    - name: Confirm Requests workspace role restriction is intact (Employee only)
+      ansible.builtin.shell:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all
+          --kwargs '{"doctype": "Has Role", "filters": {"parenttype": "Workspace", "parent": "Requests"}, "fields": ["role"]}'
+      register: _roles_result
+      changed_when: false
+
+    - name: Print role check
+      ansible.builtin.debug:
+        msg: "{{ _roles_result.stdout_lines }}"
