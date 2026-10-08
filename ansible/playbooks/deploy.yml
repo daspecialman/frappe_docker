@@ -80,12 +80,33 @@
         dest: "{{ env_file_path }}"
         mode: "0600"
 
+    - name: Run pre-deploy hook
+      ansible.builtin.command: "{{ app_pre_deploy_cmd }}"
+      args:
+        chdir: "{{ projects_root }}/{{ app_name }}"
+      when: app_pre_deploy_cmd is defined and app_pre_deploy_cmd | length > 0
+      tags: [deploy, hooks]
+
     - name: Deploy application stack
       community.docker.docker_compose_v2:
         project_src: "{{ projects_root }}/{{ app_name }}"
         files: "{{ compose_files }}"
         project_name: "{{ compose_project_name }}"
         state: present
+
+    - name: Run post-deploy hook
+      ansible.builtin.command: "{{ app_post_deploy_cmd }}"
+      args:
+        chdir: "{{ projects_root }}/{{ app_name }}"
+      when: app_post_deploy_cmd is defined and app_post_deploy_cmd | length > 0
+      tags: [deploy, hooks]
+
+    - name: Run database migrations
+      ansible.builtin.command: "{{ app_migrate_cmd }}"
+      args:
+        chdir: "{{ projects_root }}/{{ app_name }}"
+      when: app_migrate_cmd is defined and app_migrate_cmd | length > 0
+      tags: [deploy, hooks]
 
     - name: Prune unused Docker images
       ansible.builtin.command: docker image prune -f

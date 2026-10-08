@@ -30,5 +30,5 @@ healthcheck_validate_certs: true
 
 # Hooks
 # app_pre_deploy_cmd: ""
-# app_post_deploy_cmd: ""
+app_post_deploy_cmd: "docker exec frappe-backend-1 bench --site Jeyshawn clear-cache"
 # app_migrate_cmd: ""
