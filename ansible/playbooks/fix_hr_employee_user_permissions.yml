@@ -1,0 +1,257 @@
+---
+# Fix HR staff Employee access: remove self-scoped User Permissions created by the
+# "Create User Permission" checkbox on their Employee record.
+#
+# Why: an active User Permission "Employee = <own employee>" restricts the user to
+# that single Employee document (read/write/create all blocked for other employees),
+# even when their roles (HR User / HR Manager) would otherwise allow full access.
+# Unchecking the flag runs Employee.update_user_permissions(), which removes both the
+# Employee and Company user permissions for that user.
+#
+# Manual UI equivalent (per employee):
+#   Employee -> open record -> HR Settings tab -> uncheck "Create User Permission" -> Save.
+#
+# Rollback (per employee, re-creates both user permissions):
+#   bench --site Jeyshawn execute frappe.client.set_value --kwargs
+#   '{"doctype": "Employee", "name": "<employee>", "fieldname": {"create_user_permission": 1}}'
+#   - Or restore the backup taken by this playbook.
+#
+# Notes for maintainers:
+#   - frappe.client.set_value runs doc.update() + doc.save(), so on_update hooks fire
+#     and the user permissions are removed; a plain db.set_value would NOT.
+#   - client.set_value treats a falsy `value` argument specially, so the field is passed
+#     as a dict in `fieldname` and `value` is omitted.
+#   - `bench execute` prints nothing for falsy results, therefore all checks use the
+#     eval-expression form `str(...)` to always produce printable output.
+#   - Re-running this playbook is safe (idempotent): employees already unflagged are skipped.
+
+- name: Fix HR staff Employee access (remove self-scoped user permissions)
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    site_name: Jeyshawn
+    backend_container: frappe-backend-1
+    sample_other_employee: HR-EMP-00004
+
+    target_employees:
+      - name: JEL/044
+        user: chioma.obi@jeyshawnng.com
+      - name: JEL/20
+        user: ahmed.faniyi@jeyshawnng.com
+      - name: JEL/084
+        user: sarah.ikeogu@jeyshawnng.com
+
+  tasks:
+    # ------------------------------------------------------------------ preflight
+    - name: Verify SSH connectivity
+      ansible.builtin.wait_for_connection:
+        timeout: 10
+      tags: [always, preflight]
+
+    - name: Verify bench + site respond inside backend container
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} version
+      changed_when: false
+      tags: [always, preflight]
+
+    # ------------------------------------------------------------------ snapshot
+    - name: Snapshot - target employees and their Create User Permission flag
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all
+          --kwargs '{"doctype": "Employee",
+          "fields": ["name", "user_id", "company", "status", "create_user_permission"],
+          "filters": [["name", "in", {{ target_employees | map(attribute='name') | list | to_json }}]],
+          "limit_page_length": 0}'
+      register: _snap_employees
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Snapshot - current user permissions of the target users
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all
+          --kwargs '{"doctype": "User Permission",
+          "fields": ["user", "allow", "for_value"],
+          "filters": [["user", "in", {{ target_employees | map(attribute='user') | list | to_json }}]],
+          "limit_page_length": 0}'
+      register: _snap_user_perms
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Count user permissions of non-target users (change guard)
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("User Permission",
+          [["user", "not in", {{ target_employees | map(attribute='user') | list | to_json }}]]))'
+      register: _pre_other_user_perms
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Show pre-state snapshot
+      ansible.builtin.debug:
+        msg:
+          - "Employees: {{ _snap_employees.stdout }}"
+          - "Target user permissions: {{ _snap_user_perms.stdout }}"
+          - "Non-target user permission count (pre): {{ _pre_other_user_perms.stdout }}"
+      tags: [always, snapshot]
+
+    # ------------------------------------------------------------------ backup
+    - name: Backup site with files
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} backup --with-files
+      register: _backup
+      changed_when: true
+      tags: [backup]
+
+    - name: Show backup result
+      ansible.builtin.debug:
+        msg: "{{ _backup.stdout_lines | default([_backup.stdout]) }}"
+      tags: [backup]
+
+    # ------------------------------------------------------------------ apply
+    - name: Check which target employees still have Create User Permission enabled
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Employee", {"name": "{{ item.name }}", "create_user_permission": 1}))'
+      loop: "{{ target_employees }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _flag_status
+      changed_when: false
+      tags: [apply]
+
+    - name: Disable Create User Permission (removes Employee + Company user permissions)
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.client.set_value
+          --kwargs '{"doctype": "Employee", "name": "{{ item.item.name }}",
+          "fieldname": {"create_user_permission": 0}}'
+      loop: "{{ _flag_status.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout | trim == "1"
+      changed_when: true
+      tags: [apply]
+
+    # ------------------------------------------------------------------ cache
+    - name: Clear site cache
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} clear-cache
+      changed_when: true
+      tags: [cache]
+
+    # ------------------------------------------------------------------ verify
+    - name: Verify - target users have no user permissions left
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("User Permission", {"user": "{{ item.user }}"}))'
+      loop: "{{ target_employees }}"
+      loop_control:
+        label: "{{ item.user }}"
+      register: _verify_user_perms
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert target users have no user permissions left
+      ansible.builtin.assert:
+        that:
+          - (_verify_user_perms.results | map(attribute='stdout') | map('int') | sum) == 0
+        fail_msg: "Remaining user permissions: {{ _verify_user_perms.results | map(attribute='stdout') | list }}"
+        success_msg: "All target users are free of user permissions"
+      tags: [verify]
+
+    - name: Verify - target users can read another employee
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.permissions.has_permission("Employee", "read", "{{ sample_other_employee }}", "{{ item.user }}"))'
+      loop: "{{ target_employees }}"
+      loop_control:
+        label: "{{ item.user }}"
+      register: _verify_read
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert target users can read another employee
+      ansible.builtin.assert:
+        that:
+          - (_verify_read.results | map(attribute='stdout') | map('trim') | select('ne', 'True') | list) | length == 0
+        fail_msg: "Read check failed for: {{ _verify_read.results | map(attribute='stdout') | list }}"
+        success_msg: "All target users can read other employees"
+      tags: [verify]
+
+    - name: Verify - target users can write another employee
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.permissions.has_permission("Employee", "write", "{{ sample_other_employee }}", "{{ item.user }}"))'
+      loop: "{{ target_employees }}"
+      loop_control:
+        label: "{{ item.user }}"
+      register: _verify_write
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert target users can write another employee
+      ansible.builtin.assert:
+        that:
+          - (_verify_write.results | map(attribute='stdout') | map('trim') | select('ne', 'True') | list) | length == 0
+        fail_msg: "Write check failed for: {{ _verify_write.results | map(attribute='stdout') | list }}"
+        success_msg: "All target users can write other employees"
+      tags: [verify]
+
+    - name: Verify - Create User Permission flag is now off
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Employee", {"name": "{{ item.name }}", "create_user_permission": 0}))'
+      loop: "{{ target_employees }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _verify_flags
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert Create User Permission flag is off
+      ansible.builtin.assert:
+        that:
+          - (_verify_flags.results | map(attribute='stdout') | map('int') | min) >= 1
+        fail_msg: "Flag check: {{ _verify_flags.results | map(attribute='stdout') | list }}"
+        success_msg: "Create User Permission is off for all targets"
+      tags: [verify]
+
+    - name: Verify - non-target users' permissions untouched
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("User Permission",
+          [["user", "not in", {{ target_employees | map(attribute='user') | list | to_json }}]]))'
+      register: _verify_other_user_perms
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert non-target users' permissions untouched
+      ansible.builtin.assert:
+        that: (_verify_other_user_perms.stdout | trim | int) == (_pre_other_user_perms.stdout | trim | int)
+        fail_msg: >
+          Non-target user permission count changed:
+          pre={{ _pre_other_user_perms.stdout }}, post={{ _verify_other_user_perms.stdout }}
+        success_msg: "Non-target user permissions unchanged ({{ _verify_other_user_perms.stdout | trim }})"
+      tags: [verify]
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Employees fixed: {{ target_employees | map(attribute='name') | list | join(', ') }}"
+          - "Users: {{ target_employees | map(attribute='user') | list | join(', ') }}"
+          - "User permissions removed for all target users"
+          - "Non-target user permissions unchanged: {{ _verify_other_user_perms.stdout | trim }}"
+          - "Backup: {{ _backup.stdout_lines | default([]) | join(' | ') }}"
+          - "Remind users to log out/in (or hard refresh) to drop cached permissions."
+      tags: [summary]
