@@ -1,0 +1,401 @@
+---
+# Fix workflow notifications: silent Draft creation, next-approver emails preserved,
+# creator notified via a dedicated Value Change Notification.
+#
+# Behaviour after this playbook:
+#   - Creating/raising a document in Draft  -> no email to anyone.
+#   - Every workflow transition             -> email to the next step's role only.
+#   - Every workflow state change           -> one email to the document owner (creator).
+#
+# Manual UI equivalent (per workflow):
+#   1. Workflow -> open -> Document States grid -> edit the "Draft" row ->
+#      uncheck "Send Email On State" -> Save.
+#   2. Workflow form top section -> ensure "Send Email Alert" is CHECKED -> Save.
+#   3. Notification -> New: Document Type = <doctype>, Send Alert On = Value Change,
+#      Value Changed = workflow_state, Channel = Email, Enabled,
+#      Recipients -> Select Document Field = owner, subject/message as below.
+#
+# Rollback:
+#   - Set send_email = 1 on each Draft state:
+#       bench --site Jeyshawn execute frappe.db.set_value --kwargs
+#       '{"dt": "Workflow Document State", "dn": {"parent": "<workflow>", "state": "Draft"}, "field": "send_email", "val": 1}'
+#   - Delete the creator notifications (examples):
+#       bench --site Jeyshawn execute frappe.delete_doc --kwargs
+#       '{"doctype": "Notification", "name": "<notification>"}'
+#   - bench --site Jeyshawn clear-cache
+#   - Or restore the backup taken by this playbook.
+#
+# Notes for maintainers:
+#   - `bench execute` prints nothing when the return value is falsy (0/None/[]),
+#     so every count check below uses the eval-expression form `str(frappe.db.count(...))`
+#     to guarantee a printable "0".
+#   - `frappe.db.set_value` via bench execute must use its real signature kwargs:
+#     dt=doctype, dn=filters, field=fieldname, val=value.
+#   - Re-running this playbook is safe (idempotent): existing notifications are
+#     skipped, setting an already-correct value is a no-op.
+
+- name: Fix workflow notifications (silent drafts, next-role + creator emails)
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    site_name: Jeyshawn
+    backend_container: frappe-backend-1
+
+    target_workflows:
+      - Admin Request
+      - Cash Request Workflow
+      - Material Request
+      - WCC Workflow
+      - Purchase Order
+      - Service Entry Workflow
+
+    creator_notifications:
+      - name: Admin Request Creator Notification
+        doctype: Admin Request
+        word: Request
+        slug: admin
+      - name: Cash Request Creator Notification
+        doctype: Cash Request
+        word: Request
+        slug: cash
+      - name: Material Request Creator Notification
+        doctype: Material Request
+        word: Request
+        slug: material
+      - name: WCC Creator Notification
+        doctype: Work Completion Certificate
+        word: Document
+        slug: wcc
+      - name: Purchase Order Creator Notification
+        doctype: Purchase Order
+        word: Document
+        slug: po
+      - name: Service Entry Creator Notification
+        doctype: Purchase Receipt
+        word: Document
+        slug: se
+
+  tasks:
+    # ------------------------------------------------------------------ preflight
+    - name: Verify SSH connectivity
+      ansible.builtin.wait_for_connection:
+        timeout: 10
+      tags: [always, preflight]
+
+    - name: Verify bench + site respond inside backend container
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} version
+      changed_when: false
+      tags: [always, preflight]
+
+    # ------------------------------------------------------------------ snapshot
+    - name: Snapshot - workflow email alert flags
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all
+          --kwargs '{"doctype": "Workflow",
+          "fields": ["name", "is_active", "send_email_alert"],
+          "filters": [["name", "in", {{ target_workflows | to_json }}]],
+          "limit_page_length": 0}'
+      register: _snap_workflows
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Snapshot - state send_email values
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all
+          --kwargs '{"doctype": "Workflow Document State",
+          "fields": ["parent", "state", "send_email"],
+          "filters": [["parent", "in", {{ target_workflows | to_json }}]],
+          "order_by": "parent, idx", "limit_page_length": 0}'
+      register: _snap_states
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Snapshot - existing creator notifications
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all
+          --kwargs '{"doctype": "Notification",
+          "fields": ["name", "document_type", "enabled"],
+          "filters": [["name", "in", {{ creator_notifications | map(attribute='name') | list | to_json }}]],
+          "limit_page_length": 0}'
+      register: _snap_notifications
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Count pre-existing enabled non-Draft email states (change guard)
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Workflow Document State",
+          [["parent", "in", {{ target_workflows | to_json }}],
+          ["state", "!=", "Draft"], ["send_email", "=", 1]]))'
+      register: _pre_non_draft_enabled
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Show pre-state snapshot
+      ansible.builtin.debug:
+        msg:
+          - "Workflows: {{ _snap_workflows.stdout }}"
+          - "States: {{ _snap_states.stdout }}"
+          - "Existing notifications: {{ _snap_notifications.stdout }}"
+          - "Non-Draft email states (pre): {{ _pre_non_draft_enabled.stdout }}"
+      tags: [always, snapshot]
+
+    # ------------------------------------------------------------------ backup
+    - name: Backup site with files
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} backup --with-files
+      register: _backup
+      changed_when: true
+      tags: [backup]
+
+    - name: Show backup result
+      ansible.builtin.debug:
+        msg: "{{ _backup.stdout_lines | default([_backup.stdout]) }}"
+      tags: [backup]
+
+    # ------------------------------------------------- disable Draft state emails
+    - name: Disable email on Draft state (silent creation)
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.db.set_value
+          --kwargs '{"dt": "Workflow Document State",
+          "dn": {"parent": "{{ item }}", "state": "Draft"},
+          "field": "send_email", "val": 0}'
+      loop: "{{ target_workflows }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: true
+      tags: [states]
+
+    - name: Check for workflows with email alerts disabled
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Workflow",
+          [["name", "in", {{ target_workflows | to_json }}],
+          ["send_email_alert", "=", 0]]))'
+      register: _alerts_off
+      changed_when: false
+      tags: [states]
+
+    - name: Re-enable workflow email alerts (guard against accidental flip)
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.db.set_value
+          --kwargs '{"dt": "Workflow",
+          "dn": [["name", "in", {{ target_workflows | to_json }}], ["send_email_alert", "=", 0]],
+          "field": "send_email_alert", "val": 1}'
+      when: _alerts_off.stdout | trim != "0"
+      changed_when: true
+      tags: [states]
+
+    # ---------------------------------------------------- creator notifications
+    - name: Check which creator notifications already exist
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Notification", {"name": "{{ item.name }}"}))'
+      loop: "{{ creator_notifications }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _notif_exists
+      changed_when: false
+      tags: [notifications]
+
+    - name: Write notification payloads to server
+      ansible.builtin.copy:
+        dest: "/tmp/notif-{{ item.slug }}.py"
+        mode: "0600"
+        content: |
+          {"doc": {
+            "doctype": "Notification",
+            "name": "{{ item.name }}",
+            "document_type": "{{ item.doctype }}",
+            "event": "Value Change",
+            "value_changed": "workflow_state",
+            "channel": "Email",
+            "enabled": 1,
+            "subject": "{% raw %}{{ doc.doctype }} {{ doc.name }}: {{ doc.workflow_state }}{% endraw %}",
+            "message": "<p>{{ item.word }} <b>{% raw %}{{ doc.name }}{% endraw %}</b> "
+                       "({% raw %}{{ doc.doctype }}{% endraw %}) is now in state "
+                       "<b>{% raw %}{{ doc.workflow_state }}{% endraw %}</b>.</p>"
+                       "<p><a href='"
+                       "{% raw %}{{ frappe.utils.get_url_to_form(doc.doctype, doc.name) }}{% endraw %}"
+                       "'>Open the document</a></p>",
+            "recipients": [{"receiver_by_document_field": "owner"}]
+          }}
+      loop: "{{ creator_notifications }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [notifications]
+
+    - name: Create missing creator notifications
+      ansible.builtin.shell:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.client.insert --kwargs "$(cat /tmp/notif-{{ item.item.slug }}.py)"
+      loop: "{{ _notif_exists.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.stdout | trim == "0"
+      changed_when: true
+      tags: [notifications]
+
+    - name: Remove notification payload files
+      ansible.builtin.file:
+        path: "/tmp/notif-{{ item.slug }}.py"
+        state: absent
+      loop: "{{ creator_notifications }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [notifications]
+
+    # -------------------------------------------------- normalize creator flag
+    - name: Normalize Send Email To Creator on transitions (inert in v16, future-proof)
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.db.set_value
+          --kwargs '{"dt": "Workflow Transition",
+          "dn": [["parent", "in", {{ target_workflows | to_json }}], ["send_email_to_creator", "=", 1]],
+          "field": "send_email_to_creator", "val": 0}'
+      changed_when: true
+      tags: [normalize]
+
+    # ------------------------------------------------------------------ cache
+    - name: Clear site cache
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} clear-cache
+      changed_when: true
+      tags: [cache]
+
+    # ------------------------------------------------------------------ verify
+    - name: Verify - Draft states have send_email disabled
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Workflow Document State",
+          {"parent": "{{ item }}", "state": "Draft", "send_email": 0}))'
+      loop: "{{ target_workflows }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _verify_draft
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert all Draft states are silent
+      ansible.builtin.assert:
+        that:
+          - (_verify_draft.results | map(attribute='stdout') | map('int') | min) >= 1
+        fail_msg: "Some Draft states still have send_email=1 (counts: {{ _verify_draft.results | map(attribute='stdout') | list }})"
+        success_msg: "All {{ target_workflows | length }} Draft states have send_email=0"
+      tags: [verify]
+
+    - name: Verify - no workflow has email alerts disabled
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Workflow",
+          [["name", "in", {{ target_workflows | to_json }}],
+          ["send_email_alert", "=", 0]]))'
+      register: _verify_alerts
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert workflow email alerts enabled
+      ansible.builtin.assert:
+        that: _verify_alerts.stdout | trim == "0"
+        fail_msg: "Workflows with send_email_alert=0: {{ _verify_alerts.stdout }}"
+        success_msg: "All workflows have Send Email Alert enabled"
+      tags: [verify]
+
+    - name: Verify - creator notifications exist and are enabled
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Notification",
+          {"name": "{{ item.name }}", "enabled": 1, "value_changed": "workflow_state"}))'
+      loop: "{{ creator_notifications }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _verify_notifs
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert creator notifications are present and enabled
+      ansible.builtin.assert:
+        that:
+          - (_verify_notifs.results | map(attribute='stdout') | map('int') | min) >= 1
+        fail_msg: "Missing/disabled notifications (counts: {{ _verify_notifs.results | map(attribute='stdout') | list }})"
+        success_msg: "All {{ creator_notifications | length }} creator notifications enabled"
+      tags: [verify]
+
+    - name: Verify - every notification targets the document owner
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Notification Recipient",
+          [["parent", "in", {{ creator_notifications | map(attribute='name') | list | to_json }}],
+          ["receiver_by_document_field", "=", "owner"]]))'
+      register: _verify_recipients
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert notifications target the owner
+      ansible.builtin.assert:
+        that: (_verify_recipients.stdout | trim | int) == (creator_notifications | length)
+        fail_msg: "Expected {{ creator_notifications | length }} owner rows, got {{ _verify_recipients.stdout }}"
+        success_msg: "All notifications target the document owner"
+      tags: [verify]
+
+    - name: Verify - transition creator flags normalized
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Workflow Transition",
+          [["parent", "in", {{ target_workflows | to_json }}],
+          ["send_email_to_creator", "=", 1]]))'
+      register: _verify_flags
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert transition creator flags normalized
+      ansible.builtin.assert:
+        that: _verify_flags.stdout | trim == "0"
+        fail_msg: "{{ _verify_flags.stdout }} transitions still have Send Email To Creator enabled"
+        success_msg: "All transitions normalized"
+      tags: [verify]
+
+    - name: Verify - non-Draft states untouched
+      ansible.builtin.command:
+        cmd: >
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute
+          'str(frappe.db.count("Workflow Document State",
+          [["parent", "in", {{ target_workflows | to_json }}],
+          ["state", "!=", "Draft"], ["send_email", "=", 1]]))'
+      register: _verify_non_draft
+      changed_when: false
+      tags: [verify]
+
+    - name: Assert non-Draft states untouched
+      ansible.builtin.assert:
+        that: (_verify_non_draft.stdout | trim | int) == (_pre_non_draft_enabled.stdout | trim | int)
+        fail_msg: >
+          Enabled non-Draft email states changed:
+          pre={{ _pre_non_draft_enabled.stdout }}, post={{ _verify_non_draft.stdout }}
+        success_msg: "Non-Draft email states unchanged ({{ _verify_non_draft.stdout | trim }})"
+      tags: [verify]
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Draft states silent: {{ target_workflows | join(', ') }}"
+          - "Creator notifications: {{ creator_notifications | map(attribute='name') | list | join(', ') }}"
+          - "Workflow email alerts: enabled on all {{ target_workflows | length }}"
+          - "Non-Draft email states unchanged: {{ _verify_non_draft.stdout | trim }}"
+          - "Backup: {{ _backup.stdout_lines | default([]) | join(' | ') }}"
+      tags: [summary]
