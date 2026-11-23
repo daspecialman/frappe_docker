@@ -1,0 +1,229 @@
+---
+# Fix: "Not permitted" when the target user saves a Cash Request.
+#
+# Two causes:
+#   1) Cash Request.requesting_employee is a Link to Employee. The Employee
+#      DocType's custom permission for role "Employee" is read=1, if_owner=1,
+#      while Employee records are owned by the HR import account. The target
+#      user cannot read their own Employee record, so the link search returns
+#      nothing. Typing a name instead of selecting the record puts a value
+#      outside their Employee user permission, and the save fails with HTTP 403.
+#      Fix: share the target user's own Employee record read-only via DocShare.
+#   2) The target user is the only user with "Follow Created Documents"
+#      enabled. Saving a workflow-enabled Cash Request creates a Workflow
+#      Action; Frappe's follow_document() then checks read permission on that
+#      Workflow Action and raises PermissionError, so the whole Cash Request
+#      save rolls back.
+#      Fix: disable follow_created_documents / document_follow_notify, matching
+#      every other user.
+#
+# No roles, DocPerms, User Permissions, or other employee records are changed.
+# The existing "User Permission: Employee = <own employee>" still limits the
+# user to their own employee.
+#
+# Rollback:
+#   - Delete the DocShare (the playbook prints its name; or query DocShare for
+#     share_doctype=Employee, share_name=<employee>, user=<user>).
+#   - Re-enable follow_created_documents on the User record if desired.
+#   bench --site Jeyshawn clear-cache
+#
+# Re-running this playbook is safe (idempotent): an existing share is skipped
+# and the follow settings are set to the same values.
+
+- name: Fix Cash Request save for a user
+  hosts: all
+  gather_facts: false
+  serial: 1
+
+  vars:
+    site_name: Jeyshawn
+    backend_container: frappe-backend-1
+    target_user: nancy.ejims@jeyshawnng.com
+    target_employee: JEL/125
+    other_employee: JEL/070
+
+  tasks:
+    # ------------------------------------------------------------------ preflight
+    - name: Verify SSH connectivity
+      ansible.builtin.wait_for_connection:
+        timeout: 10
+      tags: [always, preflight]
+
+    - name: Verify bench + site respond inside backend container
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} version
+      changed_when: false
+      tags: [always, preflight]
+
+    # ------------------------------------------------------------------ snapshot
+    - name: Snapshot - target employee
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all --kwargs '{"doctype": "Employee", "filters": {"name": "{{ target_employee }}"}, "fields": ["name", "employee_name", "user_id", "status", "owner", "create_user_permission"], "limit_page_length": 0}'
+      register: _snap_employee
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Snapshot - existing DocShare for target
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all --kwargs '{"doctype": "DocShare", "filters": {"share_doctype": "Employee", "share_name": "{{ target_employee }}", "user": "{{ target_user }}"}, "fields": ["name", "read", "write"], "limit_page_length": 0}'
+      register: _snap_share
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Snapshot - target user follow settings
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.db.get_value('User', '{{ target_user }}', ['follow_created_documents', 'document_follow_notify'])"
+      register: _snap_follow
+      changed_when: false
+      tags: [always, snapshot]
+
+    - name: Show pre-state snapshot
+      ansible.builtin.debug:
+        msg:
+          - "Employee: {{ _snap_employee.stdout }}"
+          - "Existing share: {{ _snap_share.stdout or 'none' }}"
+          - "Follow settings: {{ _snap_follow.stdout }}"
+      tags: [always, snapshot]
+
+    # ------------------------------------------------------------------ backup
+    - name: Backup site with files
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} backup --with-files
+      register: _backup
+      changed_when: true
+      tags: [backup]
+
+    - name: Show backup result
+      ansible.builtin.debug:
+        msg: "{{ _backup.stdout_lines | default([_backup.stdout]) }}"
+      tags: [backup]
+
+    # ------------------------------------------------------------------ apply
+    - name: Share the user's own Employee record with them (read-only)
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.share.add --kwargs '{"doctype": "Employee", "name": "{{ target_employee }}", "user": "{{ target_user }}", "read": 1, "write": 0, "notify": 0}'
+      register: _share_add
+      changed_when: true
+      when: _snap_share.stdout | trim in ("", "[]")
+      tags: [apply]
+
+    - name: Show share result
+      ansible.builtin.debug:
+        msg: "{{ _share_add.stdout if _share_add is changed else 'Share already existed; skipped' }}"
+      tags: [apply]
+
+    - name: Align follow settings with other users (disable follow created documents)
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.db.set_value('User', '{{ target_user }}', {'follow_created_documents': 0, 'document_follow_notify': 0})"
+      register: _follow_set
+      changed_when: true
+      tags: [apply]
+
+    - name: Show follow settings update
+      ansible.builtin.debug:
+        msg: "{{ _follow_set.stdout }}"
+      tags: [apply]
+
+    - name: Clear site cache
+      ansible.builtin.command:
+        cmd: docker exec {{ backend_container }} bench --site {{ site_name }} clear-cache
+      changed_when: true
+      tags: [cache]
+
+    # ------------------------------------------------------------------ verify
+    - name: Verify - share exists with read permission
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute frappe.get_all --kwargs '{"doctype": "DocShare", "filters": {"share_doctype": "Employee", "share_name": "{{ target_employee }}", "user": "{{ target_user }}"}, "fields": ["name", "read", "write"], "limit_page_length": 0}'
+      register: _verify_share
+      changed_when: false
+      tags: [verify]
+
+    - name: Verify - follow settings are disabled
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.db.get_value('User', '{{ target_user }}', ['follow_created_documents', 'document_follow_notify'])"
+      register: _verify_follow
+      changed_when: false
+      tags: [verify]
+
+    - name: Verify - user can read their own Employee record
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.has_permission('Employee', 'read', '{{ target_employee }}', user='{{ target_user }}')"
+      register: _verify_read
+      changed_when: false
+      tags: [verify]
+
+    - name: Verify - Employee list returns the user's own record
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.set_user('{{ target_user }}') or [d.name for d in frappe.get_list('Employee', fields=['name'], limit_page_length=10)]"
+      register: _verify_list
+      changed_when: false
+      tags: [verify]
+
+    - name: Verify - Requesting Employee link search returns the user's own record
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.set_user('{{ target_user }}') or frappe.get_attr('frappe.desk.search.search_link')(doctype='Employee', txt='', reference_doctype='Cash Request', link_fieldname='requesting_employee', ignore_user_permissions=False)"
+      register: _verify_search
+      changed_when: false
+      tags: [verify]
+
+    - name: Verify - Cash Request create with own employee is allowed
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.set_user('{{ target_user }}') or frappe.has_permission('Cash Request', 'create', doc=frappe.get_doc({'doctype': 'Cash Request', 'department': 'Projects - JEL', 'requesting_employee': '{{ target_employee }}', 'amount': 100, 'purpose': 'verify', 'budget_code': 'verify'}), user='{{ target_user }}')"
+      register: _verify_create_own
+      changed_when: false
+      tags: [verify]
+
+    - name: Verify - Cash Request create with another employee is still denied
+      ansible.builtin.shell:
+        cmd: |
+          docker exec {{ backend_container }} bench --site {{ site_name }} execute "frappe.set_user('{{ target_user }}') or frappe.has_permission('Cash Request', 'create', doc=frappe.get_doc({'doctype': 'Cash Request', 'department': 'Facility - JEL', 'requesting_employee': '{{ other_employee }}', 'amount': 100, 'purpose': 'verify', 'budget_code': 'verify'}), user='{{ target_user }}')"
+      register: _verify_create_other
+      changed_when: false
+      tags: [verify]
+
+    - name: Show verification results
+      ansible.builtin.debug:
+        msg:
+          - "DocShare: {{ _verify_share.stdout }}"
+          - "Follow settings: {{ _verify_follow.stdout | trim }}"
+          - "Employee read: {{ _verify_read.stdout | trim }}"
+          - "Employee list: {{ _verify_list.stdout | trim }}"
+          - "Link search: {{ _verify_search.stdout | trim }}"
+          - "Cash Request create (own): {{ _verify_create_own.stdout | trim }}"
+          - "Cash Request create (other): {{ _verify_create_other.stdout | trim or 'false' }}"
+      tags: [verify]
+
+    - name: Assert all checks
+      ansible.builtin.assert:
+        that:
+          - _verify_share.stdout | trim not in ("", "[]")
+          - _verify_follow.stdout | trim in ("[0, 0]", "[0,0]")
+          - _verify_read.stdout | trim == "true"
+          - "'{{ target_employee }}' in _verify_list.stdout"
+          - "'{{ target_employee }}' in _verify_search.stdout"
+          - _verify_create_own.stdout | trim == "true"
+          - _verify_create_other.stdout | trim in ("", "false")
+        fail_msg: "Verification failed; review the values above."
+        success_msg: "All checks passed."
+      tags: [verify]
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Employee {{ target_employee }} is now readable by {{ target_user }} via a read-only DocShare."
+          - "Follow Created Documents is disabled (matches other users; avoids the Workflow Action follow PermissionError)."
+          - "The user's Employee user permission still restricts Cash Request selection to their own employee."
+          - "Ask the user to log out and back in (or hard refresh) to drop cached permissions."
+          - "Backup: {{ _backup.stdout_lines | default([]) | join(' | ') }}"
+      tags: [summary]
